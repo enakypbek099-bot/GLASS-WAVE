@@ -1,0 +1,301 @@
+name: Build GLASS WAVE Debug APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Android 14+ ARM64 Debug
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    env:
+      JAVA_VERSION: "17"
+      GRADLE_VERSION: "8.9"
+
+      ANDROID_API: "35"
+      BUILD_TOOLS_VERSION: "35.0.0"
+      NDK_VERSION: "27.0.12077973"
+      CMAKE_VERSION: "3.22.1"
+
+      CMDLINE_TOOLS_REVISION: "11076708"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare log directory
+        shell: bash
+        run: |
+          mkdir -p build-logs
+
+      - name: Configure Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Locate or install Android SDK command-line tools
+        id: android-sdk
+        shell: bash
+        run: |
+          set -euo pipefail
+          exec > >(tee -a build-logs/android-sdk-setup.log) 2>&1
+
+          if [[ -n "${ANDROID_SDK_ROOT:-}" ]]; then
+            SDK_ROOT="$ANDROID_SDK_ROOT"
+          elif [[ -n "${ANDROID_HOME:-}" ]]; then
+            SDK_ROOT="$ANDROID_HOME"
+          elif [[ -d "/usr/local/lib/android/sdk" ]]; then
+            SDK_ROOT="/usr/local/lib/android/sdk"
+          else
+            SDK_ROOT="$RUNNER_TEMP/android-sdk"
+          fi
+
+          mkdir -p "$SDK_ROOT"
+
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+
+          export ANDROID_HOME="$SDK_ROOT"
+          export ANDROID_SDK_ROOT="$SDK_ROOT"
+
+          if command -v sdkmanager >/dev/null 2>&1; then
+            SDKMANAGER="$(command -v sdkmanager)"
+
+          elif [[ -x "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" ]]; then
+            SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+
+          else
+            ARCHIVE="$RUNNER_TEMP/android-command-line-tools.zip"
+            STAGING="$RUNNER_TEMP/android-command-line-tools"
+
+            rm -rf "$STAGING"
+            mkdir -p "$STAGING"
+            mkdir -p "$SDK_ROOT/cmdline-tools"
+
+            curl \
+              --fail \
+              --location \
+              --retry 5 \
+              --retry-delay 3 \
+              --output "$ARCHIVE" \
+              "https://dl.google.com/android/repository/commandlinetools-linux-${CMDLINE_TOOLS_REVISION}_latest.zip"
+
+            unzip -q "$ARCHIVE" -d "$STAGING"
+
+            rm -rf "$SDK_ROOT/cmdline-tools/latest"
+
+            mv \
+              "$STAGING/cmdline-tools" \
+              "$SDK_ROOT/cmdline-tools/latest"
+
+            SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          fi
+
+          test -x "$SDKMANAGER"
+
+          SDKMANAGER_DIR="$(dirname "$SDKMANAGER")"
+
+          echo "$SDKMANAGER_DIR" >> "$GITHUB_PATH"
+          echo "$SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
+
+          echo "sdkmanager=$SDKMANAGER" >> "$GITHUB_OUTPUT"
+
+          echo "Android SDK root: $SDK_ROOT"
+          echo "sdkmanager: $SDKMANAGER"
+
+          "$SDKMANAGER" --version
+
+      - name: Accept licenses and install Android packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          exec > >(tee -a build-logs/android-packages.log) 2>&1
+
+          SDKMANAGER="${{ steps.android-sdk.outputs.sdkmanager }}"
+
+          yes | "$SDKMANAGER" \
+            --sdk_root="$ANDROID_SDK_ROOT" \
+            --licenses \
+            >/dev/null || true
+
+          "$SDKMANAGER" \
+            --sdk_root="$ANDROID_SDK_ROOT" \
+            "platform-tools" \
+            "platforms;android-${ANDROID_API}" \
+            "build-tools;${BUILD_TOOLS_VERSION}" \
+            "ndk;${NDK_VERSION}" \
+            "cmake;${CMAKE_VERSION}"
+
+          "$SDKMANAGER" \
+            --sdk_root="$ANDROID_SDK_ROOT" \
+            --list_installed
+
+      - name: Configure Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+          cache-read-only: false
+
+      - name: Generate Gradle Wrapper
+        shell: bash
+        run: |
+          set -euo pipefail
+          exec > >(tee -a build-logs/gradle-wrapper.log) 2>&1
+
+          gradle wrapper \
+            --gradle-version "$GRADLE_VERSION" \
+            --distribution-type bin
+
+          test -s gradle/wrapper/gradle-wrapper.jar
+
+          chmod +x gradlew
+
+          ./gradlew --version
+
+      - name: Download Google Oboe 1.9.3
+        shell: bash
+        run: |
+          set -euo pipefail
+          exec > >(tee -a build-logs/oboe-bootstrap.log) 2>&1
+
+          chmod +x scripts/bootstrap_oboe.sh
+
+          bash scripts/bootstrap_oboe.sh
+
+          test -f \
+            app/src/main/cpp/third_party/oboe/CMakeLists.txt
+
+          echo "Google Oboe source: OK"
+
+      - name: Build GLASS WAVE Debug APK
+        shell: bash
+        run: |
+          set -o pipefail
+
+          ./gradlew :app:assembleDebug \
+            --stacktrace \
+            --info \
+            --console=plain \
+            2>&1 | tee build-logs/gradle-build.log
+
+      - name: Collect diagnostics
+        if: always()
+        shell: bash
+        run: |
+          set +e
+
+          mkdir -p build-logs
+
+          exec > >(tee build-logs/environment.txt) 2>&1
+
+          echo "===== GLASS WAVE BUILD DIAGNOSTICS ====="
+
+          date -u
+          uname -a
+
+          echo ""
+          echo "===== ENVIRONMENT ====="
+
+          echo "ANDROID_HOME=${ANDROID_HOME:-NOT_SET}"
+          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-NOT_SET}"
+          echo "JAVA_HOME=${JAVA_HOME:-NOT_SET}"
+          echo "PATH=$PATH"
+
+          echo ""
+          echo "===== JAVA ====="
+
+          java -version
+
+          echo ""
+          echo "===== GRADLE ====="
+
+          if [[ -x "./gradlew" ]] && \
+             [[ -s "gradle/wrapper/gradle-wrapper.jar" ]]; then
+
+            ./gradlew --version
+          else
+            gradle --version
+          fi
+
+          echo ""
+          echo "===== SDKMANAGER ====="
+
+          SDKMANAGER="${{ steps.android-sdk.outputs.sdkmanager }}"
+
+          if [[ -n "$SDKMANAGER" ]] && \
+             [[ -x "$SDKMANAGER" ]]; then
+
+            "$SDKMANAGER" --version
+
+            "$SDKMANAGER" \
+              --sdk_root="${ANDROID_SDK_ROOT:-$ANDROID_HOME}" \
+              --list_installed
+          else
+            command -v sdkmanager || true
+          fi
+
+          echo ""
+          echo "===== ANDROID SDK TREE ====="
+
+          find \
+            "${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/dev/null}}" \
+            -maxdepth 3 \
+            -type d \
+            -print \
+            2>/dev/null | sort
+
+          echo ""
+          echo "===== GOOGLE OBOE ====="
+
+          git \
+            -C app/src/main/cpp/third_party/oboe \
+            rev-parse HEAD \
+            2>/dev/null || true
+
+          if [[ -f \
+            "app/src/main/cpp/third_party/oboe/CMakeLists.txt" ]]; then
+
+            echo "Oboe CMakeLists.txt: OK"
+          else
+            echo "Oboe CMakeLists.txt: NOT FOUND"
+          fi
+
+          echo ""
+          echo "===== OUTPUT FILES ====="
+
+          find \
+            app/build/outputs \
+            -maxdepth 6 \
+            -type f \
+            -print \
+            2>/dev/null | sort
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: glass-wave-build-logs
+          path: |
+            build-logs/
+            app/build/reports/
+            app/build/outputs/logs/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload debug APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: glass-wave-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
